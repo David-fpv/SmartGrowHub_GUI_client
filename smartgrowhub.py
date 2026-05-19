@@ -25,9 +25,9 @@ DEFAULT_DEVICE_ID    = "A0001"
 DEFAULT_TOPIC_PREFIX = "/Gomel/Tar"
 
 MODULES = [
+    ("led",        "LED"),
     ("dayLight",   "Дневной свет"),
     ("uvLight",    "УФ-свет"),
-    ("watering",   "Полив"),
     ("heater",     "Нагреватель"),
     ("humidifier", "Увлажнитель"),
     ("fan",        "Вентилятор"),
@@ -36,13 +36,14 @@ MODULES = [
 ]
 
 SENSOR_META: Dict[str, Tuple[str, str, str]] = {
-    "airTemperature":  ("🌡", "Температура воздуха",  "°C"),
-    "airHumidity":     ("💧", "Влажность воздуха",    "%"),
-    "pressure":        ("🔵", "Давление",              "Па"),
-    "plantHeight":     ("📏", "Высота растения",       "см"),
-    "light":           ("☀",  "Освещённость",          "%"),
-    "soilTemperature": ("🌱", "Температура почвы",     "°C"),
-    "soilMoisture":    ("💦", "Влажность почвы",       "%"),
+    "randomNumber":    ("#",  "Случайное число",        "-"),
+    "airTemperature":  ("T",  "Температура воздуха",   "C"),
+    "airHumidity":     ("H",  "Влажность воздуха",     "%"),
+    "pressure":        ("P",  "Давление",               "Pa"),
+    "plantHeight":     ("L",  "Высота растения",        "cm"),
+    "light":           ("*",  "Освещённость",           "%"),
+    "soilTemperature": ("ST", "Температура почвы",      "C"),
+    "soilMoisture":    ("SM", "Влажность почвы",        "%"),
 }
 
 C = {
@@ -202,7 +203,7 @@ class ModuleFrame(tk.Frame):
         self.module_name = module_name
         self.app = app
         self.schedule_units: list = []
-        self.current_mode = "0"
+        self.current_mode = "off"
         self._build()
 
     def _section(self, text: str) -> tk.LabelFrame:
@@ -223,9 +224,10 @@ class ModuleFrame(tk.Frame):
         row.pack(pady=10, padx=8)
 
         MODE_DEFS = [
-            ("ВЫКЛ", "0", C["red"]),
-            ("ВКЛ",  "1", C["accent"]),
-            ("АВТО", "2", C["blue"]),
+            ("ВЫКЛ",   "off",    C["red"]),
+            ("ВКЛ",    "on",     C["accent"]),
+            ("ЕЖЕДН",  "daily",  C["blue"]),
+            ("НЕДЕЛЯ", "weekly", C["orange"]),
         ]
         self._mode_btns: Dict[str, tk.Button] = {}
         for label, val, color in MODE_DEFS:
@@ -274,6 +276,11 @@ class ModuleFrame(tk.Frame):
         tk.Button(bf, text="− Удалить", command=self._delete_unit,
                   bg=C["red"], fg="white", relief="flat",
                   font=("Segoe UI", 9), padx=10, pady=4,
+                  cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(bf, text="✕ Очистить всё", command=self._clear_all_units,
+                  bg=C["orange"], fg="white", relief="flat",
+                  font=("Segoe UI", 9), padx=10, pady=4,
                   cursor="hand2").pack(side=tk.LEFT)
 
     # ── actions ──
@@ -303,7 +310,7 @@ class ModuleFrame(tk.Frame):
             self._refresh_list()
             self.app.send_command(
                 module_type=self.module_type,
-                mode="-1",
+                mode="none",
                 action="add",
                 schedule_unit=unit,
             )
@@ -319,9 +326,25 @@ class ModuleFrame(tk.Frame):
         self._refresh_list()
         self.app.send_command(
             module_type=self.module_type,
-            mode="-1",
+            mode="none",
             action="delete",
             schedule_unit=unit,
+        )
+
+    def _clear_all_units(self):
+        if not messagebox.askyesno(
+            "Подтверждение",
+            f"Удалить все единицы расписания модуля «{self.module_name}»?",
+            parent=self.app,
+        ):
+            return
+        self.schedule_units.clear()
+        self._refresh_list()
+        self.app.send_command(
+            module_type=self.module_type,
+            mode="none",
+            action="clearAll",
+            schedule_unit=None,
         )
 
     def _refresh_list(self):
@@ -579,10 +602,12 @@ class SmartGrowHubApp(tk.Tk):
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
-            topic = self._topic_f.get().strip() + "/sensors/"
-            client.subscribe(topic)
+            prefix = self._topic_f.get().strip()
+            client.subscribe(prefix + "/sensors/")
+            client.subscribe(prefix + "/response/")
             self.after(0, self._ui_connected)
-            self.after(0, lambda: self._log(f"Подключено. Подписка: {topic}", "INF"))
+            self.after(0, lambda: self._log(
+                f"Подключено. Подписки: {prefix}/sensors/  {prefix}/response/", "INF"))
         else:
             codes = {1: "неверный протокол", 2: "отклонён ID клиента",
                      3: "сервер недоступен", 4: "неверные данные", 5: "не авторизован"}
@@ -601,13 +626,18 @@ class SmartGrowHubApp(tk.Tk):
         except Exception:
             return
 
-        self.after(0, lambda: self._log(f"← {payload}", "IN"))
+        topic = msg.topic
+        self.after(0, lambda: self._log(f"← [{topic}] {payload}", "IN"))
 
         try:
             data = json.loads(payload)
-            self.after(0, lambda d=data: self._update_sensors(d))
         except json.JSONDecodeError:
-            pass
+            return
+
+        if "/sensors/" in topic:
+            self.after(0, lambda d=data: self._update_sensors(d))
+        elif "/response/" in topic:
+            self.after(0, lambda d=data: self._handle_response(d))
 
     # ── sensor update ──
 
@@ -619,6 +649,21 @@ class SmartGrowHubApp(tk.Tk):
                 self._sensor_cards[stype].update(value)
         now = datetime.now().strftime("%H:%M:%S")
         self._upd_lbl.config(text=f"Последнее обновление: {now}")
+
+    def _handle_response(self, data: dict):
+        code = data.get("code")
+        mid  = data.get("message_id", "")[:8]
+        CODES = {
+            2:  ("OK",  "schedule_unit изменён"),
+            1:  ("OK",  "режим изменён"),
+            -1: ("ERR", "не удалось изменить режим"),
+            -2: ("ERR", "не удалось изменить расписание"),
+            -3: ("ERR", "неверный device_id или тип модуля"),
+            -4: ("ERR", "ошибка разбора JSON"),
+        }
+        tag_text, desc = CODES.get(code, ("INF", f"неизвестный код {code}"))
+        tag = "IN" if tag_text == "OK" else "ERR"
+        self._log(f"↩ [{mid}] {tag_text}: {desc}", tag)
 
     # ── send command ──
 
